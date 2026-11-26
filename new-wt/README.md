@@ -22,11 +22,13 @@ new wt fix/typo --right lazygit --base origin/main
 From the root of dev-utils:
 
 ```sh
-new-wt/install.sh               # for your login shell
-new-wt/install.sh --shell zsh   # or for fish, zsh or bash
+new-wt/install.sh               # sets up every shell you use
+new-wt/install.sh --shell zsh   # sets up only fish, zsh or bash
 ```
 
-The installer:
+"Every shell you use" means your login shell, the shell you run the installer from, and any of fish, zsh and bash with its own startup file in your home folder (`~/.config/fish/`, `~/.zshrc`, `~/.bashrc` or `~/.bash_profile`). The settings questions are asked once for all of them.
+
+For each shell, the installer:
 
 - links `bin/new-wt` into `~/.local/bin`, so a `git pull` updates it
 - adds `~/.local/bin` to `PATH` if a new terminal of that shell doesn't have it
