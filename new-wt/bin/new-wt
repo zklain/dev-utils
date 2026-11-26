@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # new-wt — create a git worktree in <repo>/.worktrees/<branch-with-dashes>,
 # bring over the repo's local-only files, install dependencies, and open a
-# herdr tab with claude on the left and nvim on the right.
-# Works in any repo; run `new-wt --help` for options.
+# herdr tab with claude on the left and a command of your choice on the right.
+# Works in any repo; run `new-wt --help` for options and settings.
 set -euo pipefail
 
 # Local-only files, relative to the repo root, used when they exist in the main
@@ -20,42 +20,69 @@ is_env_file() {
   return 1
 }
 
+# Settings: these defaults, then the config file (install.sh writes it), then flags.
+RIGHT_PANE=nvim # command for the right pane; "shell" = plain shell, "none" = no right pane
+CLAUDE_PROMPT='' # first message for claude in a new worktree; {issue} {branch} {title} filled in
+CLAUDE_ARGS=''   # extra claude flags, as you'd type them in your shell
+config=${XDG_CONFIG_HOME:-$HOME/.config}/new-wt/config
+# shellcheck source=/dev/null
+[ ! -f "$config" ] || . "$config"
+
 usage() {
-  cat <<'EOF'
-Usage: new-wt [--base REF] [--no-open] [--no-focus] <branch> [title]
+  cat <<EOF
+Usage: new-wt [options] <branch> [title]
 
-  branch      e.g. feat/WEB-198-editable-nav-bar. An existing local or origin
-              branch is checked out; otherwise a new branch is made from the base.
-  title       names the herdr tab and the claude conversation.
-              Default: the branch without its type/ prefix.
+  branch         e.g. feat/WEB-198-editable-nav-bar. An existing local or origin
+                 branch is checked out; otherwise a new branch is made from the base.
+  title          names the herdr tab and the claude conversation.
+                 Default: the branch without its type/ prefix.
 
-  --base REF  start point for a new branch. Default: `git config wt.base`,
-              else origin/dev if it exists, else origin's default branch.
-  --no-open   don't open a herdr tab.
-  --no-focus  open the herdr tab without switching to it.
+  --prompt TEXT  first message for claude, sent right away ('' for none).
+                 Default: CLAUDE_PROMPT from the config, for new worktrees only.
+  --right CMD    command for the right pane: "shell" for a plain shell,
+                 "none" for no right pane. Default: RIGHT_PANE from the config, or nvim.
+  --base REF     start point for a new branch. Default: \`git config wt.base\`,
+                 else origin/dev if it exists, else origin's default branch.
+  --no-open      don't open a herdr tab.
+  --no-focus     open the herdr tab without switching to it.
 
-Running it again for a branch that already has a worktree reopens the tab.
+In prompts, {issue} becomes the issue key in the branch name (WEB-198 in
+feat/WEB-198-editable-nav-bar), {branch} the branch and {title} the title.
+The config prompt is skipped when it uses {issue} and the branch has none.
+
+Settings: $config
+Running new-wt again for a branch that already has a worktree reopens the tab.
 EOF
 }
 
 die() { echo "new-wt: $*" >&2; exit 1; }
 say() { printf '→ %s\n' "$*"; }
 
-base='' open=1 focus=--focus
+base='' open=1 focus=--focus prompt='' prompt_given=0 branch='' title=''
+positional() {
+  if [ -z "$branch" ]; then branch=$1
+  elif [ -z "$title" ]; then title=$1
+  else die "too many arguments: $1 (quote a title that has spaces)"; fi
+}
+# Options may come before or after the branch; after --, everything is the branch and title.
 while [ $# -gt 0 ]; do
   case "$1" in
+    --prompt) [ $# -ge 2 ] || die "--prompt needs text"; prompt=$2; prompt_given=1; shift 2 ;;
+    --right) [ $# -ge 2 ] || die "--right needs a command"; RIGHT_PANE=$2; shift 2 ;;
     --base) [ $# -ge 2 ] || die "--base needs a ref"; base=$2; shift 2 ;;
     --no-open) open=0; shift ;;
     --no-focus) focus=--no-focus; shift ;;
     -h | --help) usage; exit 0 ;;
+    --) shift; for a in "$@"; do positional "$a"; done; break ;;
     -*) die "unknown option $1 (see --help)" ;;
-    *) break ;;
+    *) positional "$1"; shift ;;
   esac
 done
-[ $# -ge 1 ] || { usage >&2; exit 1; }
-branch=$1
-title=${2:-${branch#*/}}
+[ -n "$branch" ] || { usage >&2; exit 1; }
+title=${title:-${branch#*/}}
 git check-ref-format --branch "$branch" >/dev/null 2>&1 || die "not a valid branch name: $branch"
+# First KEY-123 at the start or after a slash: WEB-198 from feat/WEB-198-... or web-198-...
+issue=$(printf '%s\n' "$branch" | grep -oE '(^|/)[A-Za-z][A-Za-z0-9]{1,9}-[0-9]+' | head -1 | sed 's|^/||' | tr '[:lower:]' '[:upper:]') || true
 
 # The main checkout is the first worktree git lists, even when run from a linked one.
 root=$(git worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p') || true
@@ -82,6 +109,7 @@ default_base() {
 # 1. The worktree. A branch already checked out somewhere reuses that worktree,
 # whatever its folder is called. awk reads the whole list, so git never hits a
 # closed pipe under pipefail.
+created=0
 existing=$(git -C "$root" worktree list --porcelain |
   awk -v ref="branch refs/heads/$branch" '/^worktree /{p=substr($0,10)} $0==ref && !f{print p; f=1}') || true
 if [ -n "$existing" ]; then
@@ -106,6 +134,7 @@ else
     # --no-track so a first `git push` can't land on the base branch.
     git -C "$root" worktree add --no-track -b "$branch" "$wt" "$base"
   fi
+  created=1
 fi
 
 # 2. Local-only files (never overwrites what the worktree already has)
@@ -140,23 +169,39 @@ if [ -f "$wt/pnpm-lock.yaml" ] && [ ! -d "$wt/node_modules" ]; then
   (cd "$wt" && pnpm install --frozen-lockfile) || echo "new-wt: pnpm install failed; finish it in the new tab" >&2
 fi
 
-# 4. herdr tab: claude | nvim
-if [ "$open" = 1 ]; then
-  if [ "${HERDR_ENV:-}" != 1 ]; then
-    echo "new-wt: not running inside herdr, so no tab was opened" >&2
-  else
-    say "opening herdr tab \"$title\""
-    # The new tab goes in the caller's workspace ("$@" is free by now, and safe empty under set -u).
-    set --
-    [ -z "${HERDR_WORKSPACE_ID:-}" ] || set -- --workspace "$HERDR_WORKSPACE_ID"
-    left=$(herdr tab create "$@" --cwd "$wt" --label "$title" "$focus" | jq -r '.result.root_pane.pane_id')
-    right=$(herdr pane split "$left" --direction right --cwd "$wt" --no-focus | jq -r '.result.pane.pane_id')
-    # The pane's shell may be fish, zsh or bash: plain single quotes work in all
-    # three once quotes and backslashes are dropped from the name.
-    name=$(printf '%s' "$title" | tr -d "'\\\\")
-    herdr pane run "$left" "claude --name '$name'" >/dev/null
-    herdr pane run "$right" nvim >/dev/null
+# 4. herdr tab: claude | RIGHT_PANE
+if [ "$open" = 1 ] && [ "${HERDR_ENV:-}" != 1 ]; then
+  echo "new-wt: not running inside herdr, so no tab was opened" >&2
+elif [ "$open" = 1 ]; then
+  if [ "$prompt_given" = 0 ] && [ "$created" = 1 ] && [ -n "$CLAUDE_PROMPT" ]; then
+    case $CLAUDE_PROMPT in
+      *'{issue}'*) if [ -n "$issue" ]; then prompt=$CLAUDE_PROMPT; else
+        echo "new-wt: the branch name has no issue key, so the default prompt wasn't sent" >&2; fi ;;
+      *) prompt=$CLAUDE_PROMPT ;;
+    esac
   fi
+  prompt=${prompt//\{issue\}/$issue}
+  prompt=${prompt//\{branch\}/$branch}
+  prompt=${prompt//\{title\}/$title}
+
+  say "opening herdr tab \"$title\""
+  # The name and prompt reach claude through the pane's environment, not the
+  # command line, so any quotes in them are safe in fish, zsh and bash alike.
+  claude_cmd="claude${CLAUDE_ARGS:+ $CLAUDE_ARGS} --name \"\$NEW_WT_NAME\""
+  [ -z "$prompt" ] || claude_cmd="$claude_cmd \"\$NEW_WT_PROMPT\""
+  # The new tab goes in the caller's workspace. Ask herdr: HERDR_WORKSPACE_ID is
+  # inherited at start-up and goes stale when the pane is moved to another workspace.
+  ws=$(herdr pane current --current 2>/dev/null | jq -r '.result.pane.workspace_id // empty') || true
+  ws=${ws:-${HERDR_WORKSPACE_ID:-}}
+  set -- # "$@" is free by now, and safe empty under set -u
+  [ -z "$ws" ] || set -- --workspace "$ws"
+  left=$(herdr tab create "$@" --cwd "$wt" --label "$title" "$focus" \
+    --env "NEW_WT_NAME=$title" --env "NEW_WT_PROMPT=$prompt" | jq -r '.result.root_pane.pane_id')
+  if [ "$RIGHT_PANE" != none ]; then
+    right=$(herdr pane split "$left" --direction right --cwd "$wt" --no-focus | jq -r '.result.pane.pane_id')
+    case $RIGHT_PANE in '' | shell) ;; *) herdr pane run "$right" "$RIGHT_PANE" >/dev/null ;; esac
+  fi
+  herdr pane run "$left" "$claude_cmd" >/dev/null
 fi
 
 echo "✓ $branch → $wt"
