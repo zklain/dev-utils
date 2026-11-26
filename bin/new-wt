@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# new-wt — create a git worktree in <repo>/.worktrees/<branch-with-dashes>,
+# bring over the repo's local-only files, install dependencies, and open a
+# herdr tab with claude on the left and nvim on the right.
+# Works in any repo; run `new-wt --help` for options.
+set -euo pipefail
+
+# Local-only files, relative to the repo root, used when they exist in the main
+# checkout and git doesn't track them. Copies are private to each worktree;
+# links share one copy with the main checkout.
+COPY_PATHS=".claude/settings.local.json"
+LINK_PATHS=".scratch CLAUDE.local.md docs/agents"
+
+# Ignored files with these names are copied wherever they sit (.env, apps/web/.env, ...).
+is_env_file() {
+  case "${1##*/}" in
+    *.example | *.sample | *.template) return 1 ;;
+    .env | .env.* | .dev.vars | *.tfvars) return 0 ;;
+  esac
+  return 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage: new-wt [--base REF] [--no-open] [--no-focus] <branch> [title]
+
+  branch      e.g. feat/WEB-198-editable-nav-bar. An existing local or origin
+              branch is checked out; otherwise a new branch is made from the base.
+  title       names the herdr tab and the claude conversation.
+              Default: the branch without its type/ prefix.
+
+  --base REF  start point for a new branch. Default: `git config wt.base`,
+              else origin/dev if it exists, else origin's default branch.
+  --no-open   don't open a herdr tab.
+  --no-focus  open the herdr tab without switching to it.
+
+Running it again for a branch that already has a worktree reopens the tab.
+EOF
+}
+
+die() { echo "new-wt: $*" >&2; exit 1; }
+say() { printf '→ %s\n' "$*"; }
+
+base='' open=1 focus=--focus
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --base) [ $# -ge 2 ] || die "--base needs a ref"; base=$2; shift 2 ;;
+    --no-open) open=0; shift ;;
+    --no-focus) focus=--no-focus; shift ;;
+    -h | --help) usage; exit 0 ;;
+    -*) die "unknown option $1 (see --help)" ;;
+    *) break ;;
+  esac
+done
+[ $# -ge 1 ] || { usage >&2; exit 1; }
+branch=$1
+title=${2:-${branch#*/}}
+git check-ref-format --branch "$branch" >/dev/null 2>&1 || die "not a valid branch name: $branch"
+
+# The main checkout is the first worktree git lists, even when run from a linked one.
+root=$(git worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p') || true
+[ -n "$root" ] || die "not inside a git repository"
+wt=$root/.worktrees/${branch//\//-}
+
+# Keep .worktrees/ out of `git status` in repos that don't ignore it yet.
+if ! git -C "$root" check-ignore -q .worktrees/; then
+  exclude=$(git -C "$root" rev-parse --git-path info/exclude)
+  case $exclude in /*) ;; *) exclude=$root/$exclude ;; esac
+  mkdir -p "$(dirname "$exclude")"
+  echo '/.worktrees/' >>"$exclude"
+  say "added /.worktrees/ to $exclude"
+fi
+
+default_base() {
+  local b
+  b=$(git -C "$root" config --get wt.base || true)
+  if [ -z "$b" ] && git -C "$root" show-ref -q --verify refs/remotes/origin/dev; then b=origin/dev; fi
+  [ -n "$b" ] || b=$(git -C "$root" symbolic-ref -q --short refs/remotes/origin/HEAD || true)
+  echo "${b:-HEAD}"
+}
+
+# 1. The worktree. A branch already checked out somewhere reuses that worktree,
+# whatever its folder is called. awk reads the whole list, so git never hits a
+# closed pipe under pipefail.
+existing=$(git -C "$root" worktree list --porcelain |
+  awk -v ref="branch refs/heads/$branch" '/^worktree /{p=substr($0,10)} $0==ref && !f{print p; f=1}') || true
+if [ -n "$existing" ]; then
+  wt=$existing
+  say "worktree already exists"
+elif [ -e "$wt" ]; then
+  die "$wt exists but isn't a git worktree"
+else
+  if git -C "$root" remote get-url origin >/dev/null 2>&1; then
+    say "fetching origin"
+    git -C "$root" fetch origin --prune --quiet || echo "new-wt: fetch failed, using local refs" >&2
+  fi
+  if git -C "$root" show-ref -q --verify "refs/heads/$branch"; then
+    say "checking out existing branch $branch"
+    git -C "$root" worktree add "$wt" "$branch"
+  elif git -C "$root" show-ref -q --verify "refs/remotes/origin/$branch"; then
+    say "checking out origin/$branch"
+    git -C "$root" worktree add --track -b "$branch" "$wt" "origin/$branch"
+  else
+    [ -n "$base" ] || base=$(default_base)
+    say "new branch $branch from $base"
+    # --no-track so a first `git push` can't land on the base branch.
+    git -C "$root" worktree add --no-track -b "$branch" "$wt" "$base"
+  fi
+fi
+
+# 2. Local-only files (never overwrites what the worktree already has)
+tracked() { git -C "$root" ls-files --error-unmatch -- "$1" >/dev/null 2>&1; }
+
+copy_in() {
+  [ -f "$root/$1" ] && [ ! -e "$wt/$1" ] && ! tracked "$1" || return 0
+  mkdir -p "$(dirname "$wt/$1")"
+  cp -p "$root/$1" "$wt/$1"
+  echo "   copied $1"
+}
+
+link_in() {
+  [ -e "$root/$1" ] && [ ! -e "$wt/$1" ] && [ ! -L "$wt/$1" ] && ! tracked "$1" || return 0
+  mkdir -p "$(dirname "$wt/$1")"
+  ln -s "$root/$1" "$wt/$1"
+  echo "   linked $1"
+}
+
+say "local files"
+for p in $COPY_PATHS; do copy_in "$p"; done
+for p in $LINK_PATHS; do link_in "$p"; done
+# --directory lists a fully ignored dir (node_modules/, .worktrees/) as one entry instead of walking it.
+git -C "$root" ls-files --others --ignored --exclude-standard --directory -z |
+  while IFS= read -r -d '' rel; do
+    if is_env_file "$rel"; then copy_in "$rel"; fi
+  done
+
+# 3. Dependencies
+if [ -f "$wt/pnpm-lock.yaml" ] && [ ! -d "$wt/node_modules" ]; then
+  say "pnpm install"
+  (cd "$wt" && pnpm install --frozen-lockfile) || echo "new-wt: pnpm install failed; finish it in the new tab" >&2
+fi
+
+# 4. herdr tab: claude | nvim
+if [ "$open" = 1 ]; then
+  if [ "${HERDR_ENV:-}" != 1 ]; then
+    echo "new-wt: not running inside herdr, so no tab was opened" >&2
+  else
+    say "opening herdr tab \"$title\""
+    # The new tab goes in the caller's workspace ("$@" is free by now, and safe empty under set -u).
+    set --
+    [ -z "${HERDR_WORKSPACE_ID:-}" ] || set -- --workspace "$HERDR_WORKSPACE_ID"
+    left=$(herdr tab create "$@" --cwd "$wt" --label "$title" "$focus" | jq -r '.result.root_pane.pane_id')
+    right=$(herdr pane split "$left" --direction right --cwd "$wt" --no-focus | jq -r '.result.pane.pane_id')
+    # The pane's shell may be fish, zsh or bash: plain single quotes work in all
+    # three once quotes and backslashes are dropped from the name.
+    name=$(printf '%s' "$title" | tr -d "'\\\\")
+    herdr pane run "$left" "claude --name '$name'" >/dev/null
+    herdr pane run "$right" nvim >/dev/null
+  fi
+fi
+
+echo "✓ $branch → $wt"
