@@ -50,7 +50,7 @@ The installer saves your answers in `~/.config/new-wt/config`. Edit that file or
 
 ## What it does
 
-1. Creates `<repo>/.worktrees/<branch, with / turned into ->` (and `.worktrees/` itself, adding it to `.git/info/exclude` if the repo doesn't ignore it). If the branch already exists locally or on origin, it checks that out. Otherwise it creates a new branch with no upstream, so a first push can't land on the base branch. If the branch already has a worktree, wherever it is, the script reuses it.
+1. Creates `<repo>/.worktrees/<branch, with / turned into ->` (and `.worktrees/` itself, adding it to `.git/info/exclude` if the repo doesn't ignore it). If the branch already exists locally or on origin, it checks that out. You can name an origin branch the way `git branch -r` lists it: `origin/feat/x` (or `remotes/origin/feat/x`) checks out `feat/x`. Otherwise it creates a new branch with no upstream, so a first push can't land on the base branch. If the branch already has a worktree, wherever it is, the script reuses it.
 2. Makes a new branch from `git config wt.base` if that is set, else `origin/dev` if it exists, else origin's default branch.
 3. Copies local-only files from the main checkout: `.claude/settings.local.json`, plus any ignored `.env`, `.env.*`, `.dev.vars` or `*.tfvars` files. It symlinks `.scratch`, `CLAUDE.local.md` and `docs/agents`. It never overwrites a file the worktree already has. The lists are at the top of `bin/new-wt`.
 4. Runs `pnpm install --frozen-lockfile` if the repo has a `pnpm-lock.yaml` and the worktree has no `node_modules` yet.

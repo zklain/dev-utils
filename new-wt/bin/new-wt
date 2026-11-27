@@ -34,6 +34,7 @@ Usage: new-wt [options] <branch> [title]
 
   branch         e.g. feat/WEB-198-editable-nav-bar. An existing local or origin
                  branch is checked out; otherwise a new branch is made from the base.
+                 origin/feat/WEB-198-editable-nav-bar means the same branch.
   title          names the herdr tab and the claude conversation.
                  Default: the branch without its type/ prefix.
 
@@ -78,6 +79,11 @@ while [ $# -gt 0 ]; do
     *) positional "$1"; shift ;;
   esac
 done
+# A remote branch named the way git lists it (origin/feat/x, remotes/origin/feat/x,
+# refs/remotes/origin/feat/x) means the branch feat/x, not a new local branch called origin/feat/x.
+case $branch in
+  origin/* | remotes/origin/* | refs/remotes/origin/*) branch=${branch#*origin/} ;;
+esac
 [ -n "$branch" ] || { usage >&2; exit 1; }
 title=${title:-${branch#*/}}
 git check-ref-format --branch "$branch" >/dev/null 2>&1 || die "not a valid branch name: $branch"
@@ -127,7 +133,8 @@ else
     git -C "$root" worktree add "$wt" "$branch"
   elif git -C "$root" show-ref -q --verify "refs/remotes/origin/$branch"; then
     say "checking out origin/$branch"
-    git -C "$root" worktree add --track -b "$branch" "$wt" "origin/$branch"
+    # The full ref, so a stray local branch called origin/<branch> can't shadow it.
+    git -C "$root" worktree add --track -b "$branch" "$wt" "refs/remotes/origin/$branch"
   else
     [ -n "$base" ] || base=$(default_base)
     say "new branch $branch from $base"
